@@ -58,7 +58,11 @@ class SharkIqUpdateCoordinator(DataUpdateCoordinator[Dict[str, SharkIqVacuum]]):
             await api.async_sign_in()
             devices = await api.async_get_devices(update=True)
         except SharkIqAuthError as err:
-            raise UpdateFailed(f"Auth failed: {err}") from err
+            LOGGER.warning(
+                "SharkIQ authentication failed — triggering re-authorization flow: %s", err
+            )
+            self.entry.async_start_reauth(self.hass)
+            raise UpdateFailed(f"Auth failed, re-authorization required: {err}") from err
         except Exception as err:
             raise UpdateFailed(f"Error fetching Shark IQ data: {err}") from err
 

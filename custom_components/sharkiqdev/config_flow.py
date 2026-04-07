@@ -180,23 +180,104 @@ class SharkIqConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             _, errors = await self._async_validate_input(user_input)
 
+            if errors.get("base") == "interactive_required" and self._pending_auth_flow:
+                # The API requires manual browser auth — route through that step.
+                return await self.async_step_reauth_interactive()
+
             if not errors:
-                errors = {"base": "unknown"}
-                if entry := await self.async_set_unique_id(self.unique_id):
+                existing_entry = await self.async_set_unique_id(self.unique_id)
+                if existing_entry:
                     data = dict(self._pending_user_input)
                     rt = data.get(AUTH0_REFRESH_TOKEN_KEY)
                     if rt:
                         data[AUTH0_REFRESH_TOKEN_KEY] = rt
                     data.pop("force_interactive_debug", None)
-                    self.hass.config_entries.async_update_entry(entry, data=data)
+                    self.hass.config_entries.async_update_entry(existing_entry, data=data)
                     return self.async_abort(reason="reauth_successful")
-
-            if errors["base"] != "invalid_auth":
-                return self.async_abort(reason=errors["base"])
+                errors = {"base": "unknown"}
 
         return self.async_show_form(
             step_id="reauth_confirm",
             data_schema=SHARKIQ_SCHEMA,
+            errors=errors,
+        )
+
+    async def async_step_reauth_interactive(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle interactive Auth0 re-authorization via browser redirect.
+
+        Mirrors async_step_interactive but updates the existing config entry
+        instead of creating a new one, so the integration is repaired in-place.
+        """
+        if not self._pending_auth_flow or not self._pending_user_input:
+            return self.async_abort(reason="unknown")
+
+        errors: dict[str, str] = {}
+        auth_url = self._pending_auth_flow.get("url", "")
+        auth_label = auth_url or "Auth link unavailable. Go back and retry."
+
+        if user_input is not None:
+            redirect_url = (user_input.get("redirect_url") or "").strip()
+
+            code = None
+            if redirect_url:
+                parsed = aiohttp.helpers.URL(redirect_url)
+                code = parsed.query.get("code")
+
+            if code and not errors:
+                new_websession = async_create_clientsession(
+                    self.hass,
+                    cookie_jar=aiohttp.CookieJar(unsafe=True, quote_cookie=False),
+                )
+                ayla_api = get_ayla_api(
+                    username=self._pending_user_input[CONF_USERNAME],
+                    password=self._pending_user_input[CONF_PASSWORD],
+                    websession=new_websession,
+                    europe=(self._pending_user_input[CONF_REGION] == SHARKIQ_REGION_EUROPE),
+                )
+                try:
+                    async with asyncio.timeout(15):
+                        await ayla_api.complete_interactive_login(
+                            code,
+                            code_verifier=self._pending_auth_flow.get("code_verifier"),
+                        )
+                except (TimeoutError, aiohttp.ClientError, TypeError) as error:
+                    LOGGER.error(error)
+                    errors["base"] = "cannot_connect"
+                except SharkIqAuthError as error:
+                    LOGGER.error(error)
+                    errors["base"] = "invalid_code"
+                except Exception as error:
+                    LOGGER.exception("Unexpected exception during interactive reauth")
+                    errors["base"] = "unknown"
+
+                if not errors:
+                    existing_entry = await self.async_set_unique_id(self.unique_id)
+                    if existing_entry:
+                        data = dict(self._pending_user_input)
+                        rt = getattr(ayla_api, "auth0_refresh_token", None)
+                        if rt:
+                            data[AUTH0_REFRESH_TOKEN_KEY] = rt
+                        data.pop("force_interactive_debug", None)
+                        self.hass.config_entries.async_update_entry(existing_entry, data=data)
+                        return self.async_abort(reason="reauth_successful")
+                    errors = {"base": "unknown"}
+            elif not errors:
+                errors["base"] = "missing_token"
+
+        return self.async_show_form(
+            step_id="reauth_interactive",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("redirect_url"): str,
+                }
+            ),
+            description_placeholders={
+                "auth_url": auth_url or "#",
+                "auth_label": auth_label,
+                "state": self._pending_auth_flow.get("state", ""),
+            },
             errors=errors,
         )
 
