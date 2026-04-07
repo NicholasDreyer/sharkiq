@@ -39,6 +39,12 @@
           "redirect_url": "Redirect URL"
         },
         "description": "Open this link in a desktop browser: [{auth_label}]({auth_url})\n\nPress F12 to open Developer Tools and navigate to the Network tab, sign in, under the Network tab, click the GET line, look on the right for Response Headers, copy the value of location, then paste that redirect URL below."
+      },
+      "reauth_interactive": {
+        "data": {
+          "redirect_url": "Redirect URL"
+        },
+        "description": "Your SharkIQ session has expired and needs to be re-authorized.\n\nOpen this link in a desktop browser: [{auth_label}]({auth_url})\n\nPress F12 to open Developer Tools and navigate to the Network tab, sign in, under the Network tab, click the GET line, look on the right for Response Headers, copy the value of location, then paste that redirect URL below."
       }
     }
   },
