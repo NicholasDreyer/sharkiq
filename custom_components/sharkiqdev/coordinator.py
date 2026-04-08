@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .ayla_api_ext import SharkExtendedMixin
 from .const import (
     AUTH0_REFRESH_TOKEN_KEY,
     DOMAIN,
@@ -33,6 +34,7 @@ class SharkIqUpdateCoordinator(DataUpdateCoordinator[Dict[str, SharkIqVacuum]]):
         )
         self.entry = entry
         self.shark_vacs: Dict[str, SharkIqVacuum] = {}
+        self.extended_vacs: Dict[str, SharkExtendedMixin] = {}
         self._ayla_api = None
         self._region_eu = entry.data.get(CONF_REGION) == SHARKIQ_REGION_EUROPE
         self._online_serials: set[str] = set()
@@ -72,6 +74,15 @@ class SharkIqUpdateCoordinator(DataUpdateCoordinator[Dict[str, SharkIqVacuum]]):
         # Mark any device we successfully fetched as online for this cycle
         self._online_serials = {device.serial_number for device in devices}
 
+        # Maintain extended mixin wrappers — create new ones for new devices,
+        # keep existing ones so their cached room maps are preserved.
+        for dsn, vac in self.shark_vacs.items():
+            if dsn not in self.extended_vacs:
+                self.extended_vacs[dsn] = SharkExtendedMixin(vac)
+            else:
+                # Update the vacuum reference in case a new object was returned
+                self.extended_vacs[dsn]._vacuum = vac
+
         def _mask_sn(sn: str) -> str:
             # Hide most of the serial for logs
             if not sn or len(sn) < 4:
@@ -109,3 +120,19 @@ class SharkIqUpdateCoordinator(DataUpdateCoordinator[Dict[str, SharkIqVacuum]]):
 
         # Fallback to connection_status flag from the API listing.
         return getattr(device, "connection_status", "").lower() != "offline"
+
+    async def async_load_room_maps(self) -> None:
+        """Load room maps for all vacuums from the Mobile_App_Room_Definition property.
+
+        Called once at startup. Room maps are cached in the extended mixin objects and
+        preserved across subsequent data updates.
+        """
+        for dsn, ext_vac in self.extended_vacs.items():
+            try:
+                await ext_vac.async_load_room_map()
+            except Exception as err:
+                LOGGER.warning(
+                    "Failed to load room map for %s: %s",
+                    ext_vac.vacuum.name,
+                    err,
+                )

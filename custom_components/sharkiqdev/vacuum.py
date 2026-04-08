@@ -21,7 +21,17 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, LOGGER, SERVICE_CLEAN_ROOM, SHARK
+from .ayla_api_ext import SharkExtendedMixin
+from .const import (
+    CLEAN_TYPE_DRY,
+    CLEAN_TYPE_WET,
+    DOMAIN,
+    LOGGER,
+    SERVICE_CLEAN_ROOM,
+    SERVICE_CLEAN_ROOMS_V3,
+    SERVICE_SET_FLOW_MODE,
+    SHARK,
+)
 from .coordinator import SharkIqUpdateCoordinator
 
 OPERATING_STATE_MAP = {
@@ -30,6 +40,13 @@ OPERATING_STATE_MAP = {
     OperatingModes.STOP: VacuumActivity.IDLE,
     OperatingModes.RETURN: VacuumActivity.RETURNING,
 }
+
+# Add mop operating modes if this firmware supports them
+try:
+    OPERATING_STATE_MAP[OperatingModes.MOP] = VacuumActivity.CLEANING
+    OPERATING_STATE_MAP[OperatingModes.VACCUM_AND_MOP] = VacuumActivity.CLEANING
+except AttributeError:
+    pass
 
 FAN_SPEEDS_MAP = {
     "Eco": PowerModes.ECO,
@@ -45,6 +62,10 @@ ATTR_ERROR_MSG = "last_error_message"
 ATTR_LOW_LIGHT = "low_light"
 ATTR_RECHARGE_RESUME = "recharge_and_resume"
 ATTR_ROOMS = "rooms"
+ATTR_ROOM_MAP = "room_map"
+ATTR_MOP_ATTACHED = "mop_plate_attached"
+ATTR_DOCK_SENSORS = "dock_sensor_data"
+ATTR_CLEANING_PARAMS = "cleaning_parameters"
 
 
 async def async_setup_entry(
@@ -54,16 +75,22 @@ async def async_setup_entry(
 ) -> None:
     """Set up the Shark IQ vacuum cleaner."""
     coordinator: SharkIqUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
-    devices: Iterable[SharkIqVacuum] = coordinator.shark_vacs.values()
-    device_names = [d.name for d in devices]
+
+    entities = []
+    for dsn, vac in coordinator.shark_vacs.items():
+        ext_vac = coordinator.extended_vacs[dsn]
+        entities.append(SharkVacuumEntity(vac, ext_vac, coordinator))
+
     LOGGER.debug(
         "Found %d Shark IQ device(s): %s",
-        len(device_names),
-        ", ".join([d.name for d in devices]),
+        len(entities),
+        ", ".join(e.sharkiq.name for e in entities),
     )
-    async_add_entities([SharkVacuumEntity(d, coordinator) for d in devices])
+    async_add_entities(entities)
 
     platform = entity_platform.async_get_current_platform()
+
+    # Legacy room cleaning (base64-encoded Areas_To_Clean, older robots)
     platform.async_register_entity_service(
         SERVICE_CLEAN_ROOM,
         {
@@ -72,6 +99,34 @@ async def async_setup_entry(
             ),
         },
         "async_clean_room",
+    )
+
+    # V3 room cleaning (JSON-based SET_AreasToClean_V3, newer LiDAR robots)
+    platform.async_register_entity_service(
+        SERVICE_CLEAN_ROOMS_V3,
+        {
+            vol.Required(ATTR_ROOMS): vol.All(
+                cv.ensure_list, vol.Length(min=1), [cv.string]
+            ),
+            vol.Optional("clean_type", default=CLEAN_TYPE_DRY): vol.In(
+                [CLEAN_TYPE_DRY, CLEAN_TYPE_WET]
+            ),
+            vol.Optional("passes", default=1): vol.All(
+                vol.Coerce(int), vol.Range(min=1, max=3)
+            ),
+        },
+        "async_clean_rooms_v3",
+    )
+
+    # Water flow mode (mopping water level)
+    platform.async_register_entity_service(
+        SERVICE_SET_FLOW_MODE,
+        {
+            vol.Required("flow_level"): vol.All(
+                vol.Coerce(int), vol.Range(min=0, max=3)
+            ),
+        },
+        "async_set_flow_mode_service",
     )
 
 
@@ -91,14 +146,20 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         | VacuumEntityFeature.STOP
         | VacuumEntityFeature.LOCATE
     )
-    _unrecorded_attributes = frozenset({ATTR_ROOMS})
+    _unrecorded_attributes = frozenset(
+        {ATTR_ROOMS, ATTR_ROOM_MAP, ATTR_DOCK_SENSORS, ATTR_CLEANING_PARAMS}
+    )
 
     def __init__(
-        self, sharkiq: SharkIqVacuum, coordinator: SharkIqUpdateCoordinator
+        self,
+        sharkiq: SharkIqVacuum,
+        ext_vac: SharkExtendedMixin,
+        coordinator: SharkIqUpdateCoordinator,
     ) -> None:
         """Create a new SharkVacuumEntity."""
         super().__init__(coordinator)
         self.sharkiq = sharkiq
+        self.ext_vac = ext_vac
         self._attr_unique_id = sharkiq.serial_number
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, sharkiq.serial_number)},
@@ -166,7 +227,6 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
     @property
     def available(self) -> bool:
         """Determine if the sensor is available based on API results."""
-        # If the last update was successful...
         return self.coordinator.last_update_success and self.is_online
 
     @property
@@ -199,7 +259,7 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         await self.sharkiq.async_find_device()
 
     async def async_clean_room(self, rooms: list[str], **kwargs: Any) -> None:
-        """Clean specific rooms."""
+        """Clean specific rooms using the legacy base64-encoded API (older robots)."""
         rooms_to_clean = []
         valid_rooms = self.available_rooms or []
         rooms = [room.replace("_", " ").title() for room in rooms]
@@ -213,8 +273,43 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
                     translation_placeholders={"room": room},
                 )
 
-        LOGGER.debug("Cleaning room(s): %s", rooms_to_clean)
+        LOGGER.debug("Cleaning room(s) (legacy): %s", rooms_to_clean)
         await self.sharkiq.async_clean_rooms(rooms_to_clean)
+        await self.coordinator.async_refresh()
+
+    async def async_clean_rooms_v3(
+        self,
+        rooms: list[str],
+        clean_type: str = CLEAN_TYPE_DRY,
+        passes: int = 1,
+        **kwargs: Any,
+    ) -> None:
+        """Clean specific rooms using the V3 JSON API (newer LiDAR robots)."""
+        available = self.ext_vac.get_available_rooms()
+        for room in rooms:
+            if room not in available:
+                raise ServiceValidationError(
+                    translation_domain=DOMAIN,
+                    translation_key="invalid_room",
+                    translation_placeholders={
+                        "room": room,
+                        "available": ", ".join(available) if available else "none loaded",
+                    },
+                )
+
+        LOGGER.info(
+            "Starting V3 room clean: rooms=%s, type=%s, passes=%d",
+            rooms,
+            clean_type,
+            passes,
+        )
+        await self.ext_vac.async_clean_rooms_v3(rooms, clean_type, passes)
+        await self.coordinator.async_refresh()
+
+    async def async_set_flow_mode_service(self, flow_level: int, **kwargs: Any) -> None:
+        """Set the water flow level for mopping (0=off, 1=low, 2=medium, 3=high)."""
+        LOGGER.info("Setting flow mode to %d", flow_level)
+        await self.ext_vac.async_set_flow_mode(flow_level)
         await self.coordinator.async_refresh()
 
     @property
@@ -234,7 +329,6 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         )
         await self.coordinator.async_refresh()
 
-    # Various attributes we want to expose
     @property
     def recharge_resume(self) -> bool | None:
         """Recharge and resume mode active."""
@@ -252,7 +346,7 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
 
     @property
     def available_rooms(self) -> list | None:
-        """Return a list of rooms available to clean."""
+        """Return a list of rooms available to clean (legacy Robot_Room_List property)."""
         room_list = self.sharkiq.get_property_value(Properties.ROBOT_ROOM_LIST)
         if room_list:
             return room_list.split(":")[1:]
@@ -261,10 +355,35 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return a dictionary of device state attributes specific to sharkiq."""
-        return {
+        attrs: dict[str, Any] = {
             ATTR_ERROR_CODE: self.error_code,
             ATTR_ERROR_MSG: self.sharkiq.error_text,
             ATTR_LOW_LIGHT: self.low_light,
             ATTR_RECHARGE_RESUME: self.recharge_resume,
-            ATTR_ROOMS: self.available_rooms,
+            ATTR_ROOMS: self.ext_vac.get_available_rooms(),
         }
+
+        # Extended attributes — only populated on devices that support them
+        mop = self.ext_vac.get_mop_plate_attached()
+        if mop is not None:
+            attrs[ATTR_MOP_ATTACHED] = mop
+
+        clean_params = self.ext_vac.get_cleaning_parameters()
+        if clean_params:
+            attrs[ATTR_CLEANING_PARAMS] = clean_params
+
+        dock_data = self.ext_vac.get_dock_sensor_data()
+        if dock_data:
+            attrs[ATTR_DOCK_SENSORS] = dock_data
+
+        # Room map summary (names + sizes only, polygon arrays excluded via _unrecorded_attributes)
+        if self.ext_vac.room_map:
+            attrs[ATTR_ROOM_MAP] = {
+                name: {
+                    "id": info["robot_room_name"],
+                    "size_m2": round(info["area_size"], 1),
+                }
+                for name, info in self.ext_vac.room_map.items()
+            }
+
+        return attrs

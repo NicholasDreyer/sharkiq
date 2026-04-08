@@ -1,0 +1,206 @@
+From 5196d6e3e2d7c1b9cdbb2ffef804a7e873357c6b Mon Sep 17 00:00:00 2001
+From: Nicholas Dreyer <nicholas@example.com>
+Date: Tue, 7 Apr 2026 15:40:09 +0000
+Subject: [PATCH] fix: trigger reauth flow on auth failure and support
+ interactive reauth
+
+When Home Assistant restarts, the stored session token may be expired or
+invalid. Previously the coordinator would catch SharkIqAuthError and raise
+UpdateFailed, leaving the integration permanently broken with no way to
+re-authorize through the UI.
+
+Changes:
+- coordinator.py: call entry.async_start_reauth() on SharkIqAuthError so
+  HA automatically presents the re-authorization UI to the user instead of
+  silently failing forever.
+
+- config_flow.py: add async_step_reauth_interactive() which mirrors the
+  initial async_step_interactive() but updates the existing config entry
+  (async_update_entry + reauth_successful) rather than creating a new one.
+  Route async_step_reauth_confirm() through this new step whenever
+  interactive_required is raised, exactly as the initial setup flow does.
+  Also fixed the success path in reauth_confirm (was calling async_abort
+  on error keys that are not abort reasons).
+
+- strings.json / translations/en.json: add reauth_interactive step with
+  a description that explains the session has expired and guides the user
+  through the same browser redirect capture process as initial setup.
+---
+ custom_components/sharkiqdev/config_flow.py   | 93 +++++++++++++++++--
+ custom_components/sharkiqdev/coordinator.py   |  6 +-
+ custom_components/sharkiqdev/strings.json     |  6 ++
+ .../sharkiqdev/translations/en.json           |  6 ++
+ 4 files changed, 104 insertions(+), 7 deletions(-)
+
+diff --git a/custom_components/sharkiqdev/config_flow.py b/custom_components/sharkiqdev/config_flow.py
+index 79c1993..314fa95 100644
+--- a/custom_components/sharkiqdev/config_flow.py
++++ b/custom_components/sharkiqdev/config_flow.py
+@@ -180,19 +180,21 @@ class SharkIqConfigFlow(ConfigFlow, domain=DOMAIN):
+         if user_input is not None:
+             _, errors = await self._async_validate_input(user_input)
+ 
++            if errors.get("base") == "interactive_required" and self._pending_auth_flow:
++                # The API requires manual browser auth — route through that step.
++                return await self.async_step_reauth_interactive()
++
+             if not errors:
+-                errors = {"base": "unknown"}
+-                if entry := await self.async_set_unique_id(self.unique_id):
++                existing_entry = await self.async_set_unique_id(self.unique_id)
++                if existing_entry:
+                     data = dict(self._pending_user_input)
+                     rt = data.get(AUTH0_REFRESH_TOKEN_KEY)
+                     if rt:
+                         data[AUTH0_REFRESH_TOKEN_KEY] = rt
+                     data.pop("force_interactive_debug", None)
+-                    self.hass.config_entries.async_update_entry(entry, data=data)
++                    self.hass.config_entries.async_update_entry(existing_entry, data=data)
+                     return self.async_abort(reason="reauth_successful")
+-
+-            if errors["base"] != "invalid_auth":
+-                return self.async_abort(reason=errors["base"])
++                errors = {"base": "unknown"}
+ 
+         return self.async_show_form(
+             step_id="reauth_confirm",
+@@ -200,6 +202,85 @@ class SharkIqConfigFlow(ConfigFlow, domain=DOMAIN):
+             errors=errors,
+         )
+ 
++    async def async_step_reauth_interactive(
++        self, user_input: dict[str, Any] | None = None
++    ) -> ConfigFlowResult:
++        """Handle interactive Auth0 re-authorization via browser redirect.
++
++        Mirrors async_step_interactive but updates the existing config entry
++        instead of creating a new one, so the integration is repaired in-place.
++        """
++        if not self._pending_auth_flow or not self._pending_user_input:
++            return self.async_abort(reason="unknown")
++
++        errors: dict[str, str] = {}
++        auth_url = self._pending_auth_flow.get("url", "")
++        auth_label = auth_url or "Auth link unavailable. Go back and retry."
++
++        if user_input is not None:
++            redirect_url = (user_input.get("redirect_url") or "").strip()
++
++            code = None
++            if redirect_url:
++                parsed = aiohttp.helpers.URL(redirect_url)
++                code = parsed.query.get("code")
++
++            if code and not errors:
++                new_websession = async_create_clientsession(
++                    self.hass,
++                    cookie_jar=aiohttp.CookieJar(unsafe=True, quote_cookie=False),
++                )
++                ayla_api = get_ayla_api(
++                    username=self._pending_user_input[CONF_USERNAME],
++                    password=self._pending_user_input[CONF_PASSWORD],
++                    websession=new_websession,
++                    europe=(self._pending_user_input[CONF_REGION] == SHARKIQ_REGION_EUROPE),
++                )
++                try:
++                    async with asyncio.timeout(15):
++                        await ayla_api.complete_interactive_login(
++                            code,
++                            code_verifier=self._pending_auth_flow.get("code_verifier"),
++                        )
++                except (TimeoutError, aiohttp.ClientError, TypeError) as error:
++                    LOGGER.error(error)
++                    errors["base"] = "cannot_connect"
++                except SharkIqAuthError as error:
++                    LOGGER.error(error)
++                    errors["base"] = "invalid_code"
++                except Exception as error:
++                    LOGGER.exception("Unexpected exception during interactive reauth")
++                    errors["base"] = "unknown"
++
++                if not errors:
++                    existing_entry = await self.async_set_unique_id(self.unique_id)
++                    if existing_entry:
++                        data = dict(self._pending_user_input)
++                        rt = getattr(ayla_api, "auth0_refresh_token", None)
++                        if rt:
++                            data[AUTH0_REFRESH_TOKEN_KEY] = rt
++                        data.pop("force_interactive_debug", None)
++                        self.hass.config_entries.async_update_entry(existing_entry, data=data)
++                        return self.async_abort(reason="reauth_successful")
++                    errors = {"base": "unknown"}
++            elif not errors:
++                errors["base"] = "missing_token"
++
++        return self.async_show_form(
++            step_id="reauth_interactive",
++            data_schema=vol.Schema(
++                {
++                    vol.Required("redirect_url"): str,
++                }
++            ),
++            description_placeholders={
++                "auth_url": auth_url or "#",
++                "auth_label": auth_label,
++                "state": self._pending_auth_flow.get("state", ""),
++            },
++            errors=errors,
++        )
++
+     async def async_step_interactive(
+         self, user_input: dict[str, Any] | None = None
+     ) -> ConfigFlowResult:
+diff --git a/custom_components/sharkiqdev/coordinator.py b/custom_components/sharkiqdev/coordinator.py
+index 6ee61a5..e9a2a78 100644
+--- a/custom_components/sharkiqdev/coordinator.py
++++ b/custom_components/sharkiqdev/coordinator.py
+@@ -58,7 +58,11 @@ class SharkIqUpdateCoordinator(DataUpdateCoordinator[Dict[str, SharkIqVacuum]]):
+             await api.async_sign_in()
+             devices = await api.async_get_devices(update=True)
+         except SharkIqAuthError as err:
+-            raise UpdateFailed(f"Auth failed: {err}") from err
++            LOGGER.warning(
++                "SharkIQ authentication failed — triggering re-authorization flow: %s", err
++            )
++            self.entry.async_start_reauth(self.hass)
++            raise UpdateFailed(f"Auth failed, re-authorization required: {err}") from err
+         except Exception as err:
+             raise UpdateFailed(f"Error fetching Shark IQ data: {err}") from err
+ 
+diff --git a/custom_components/sharkiqdev/strings.json b/custom_components/sharkiqdev/strings.json
+index 9d3306d..1501ca4 100644
+--- a/custom_components/sharkiqdev/strings.json
++++ b/custom_components/sharkiqdev/strings.json
+@@ -39,6 +39,12 @@
+           "redirect_url": "Redirect URL"
+         },
+         "description": "Open this link in a desktop browser: [{auth_label}]({auth_url})\n\nPress F12 to open Developer Tools and navigate to the Network tab, sign in, under the Network tab, click the GET line, look on the right for Response Headers, copy the value of location, then paste that redirect URL below."
++      },
++      "reauth_interactive": {
++        "data": {
++          "redirect_url": "Redirect URL"
++        },
++        "description": "Your SharkIQ session has expired and needs to be re-authorized.\n\nOpen this link in a desktop browser: [{auth_label}]({auth_url})\n\nPress F12 to open Developer Tools and navigate to the Network tab, sign in, under the Network tab, click the GET line, look on the right for Response Headers, copy the value of location, then paste that redirect URL below."
+       }
+     }
+   },
+diff --git a/custom_components/sharkiqdev/translations/en.json b/custom_components/sharkiqdev/translations/en.json
+index 9d3306d..1501ca4 100644
+--- a/custom_components/sharkiqdev/translations/en.json
++++ b/custom_components/sharkiqdev/translations/en.json
+@@ -39,6 +39,12 @@
+           "redirect_url": "Redirect URL"
+         },
+         "description": "Open this link in a desktop browser: [{auth_label}]({auth_url})\n\nPress F12 to open Developer Tools and navigate to the Network tab, sign in, under the Network tab, click the GET line, look on the right for Response Headers, copy the value of location, then paste that redirect URL below."
++      },
++      "reauth_interactive": {
++        "data": {
++          "redirect_url": "Redirect URL"
++        },
++        "description": "Your SharkIQ session has expired and needs to be re-authorized.\n\nOpen this link in a desktop browser: [{auth_label}]({auth_url})\n\nPress F12 to open Developer Tools and navigate to the Network tab, sign in, under the Network tab, click the GET line, look on the right for Response Headers, copy the value of location, then paste that redirect URL below."
+       }
+     }
+   },
+-- 
+2.43.0
+

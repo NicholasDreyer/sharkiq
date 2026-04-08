@@ -1,15 +1,53 @@
 clean_room:
   target:
     entity:
-      integration: "sharkiq"
+      integration: "sharkiqdev"
       domain: "vacuum"
-
   fields:
     rooms:
       required: true
       advanced: false
       example: "Kitchen"
-      default: ""
       selector:
-        area:
+        text:
           multiple: true
+
+clean_rooms_v3:
+  target:
+    entity:
+      integration: "sharkiqdev"
+      domain: "vacuum"
+  fields:
+    rooms:
+      required: true
+      selector:
+        text:
+          multiple: true
+    clean_type:
+      default: "dry"
+      selector:
+        select:
+          options:
+            - "dry"
+            - "wet"
+    passes:
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 3
+          step: 1
+
+set_flow_mode:
+  target:
+    entity:
+      integration: "sharkiqdev"
+      domain: "vacuum"
+  fields:
+    flow_level:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 3
+          step: 1
