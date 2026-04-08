@@ -421,4 +421,7 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
                 for name, info in self.ext_vac.room_map.items()
             }
 
+        attrs["debug_room_list"] = self.sharkiq.get_property_value(Properties.ROBOT_ROOM_LIST)
+        attrs["debug_clean_room_cmd"] = self.sharkiq.get_property_value("CleanRoomCommand")
+
         return attrs
