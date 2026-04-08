@@ -30,6 +30,7 @@ clean_rooms_v3:
           options:
             - "dry"
             - "wet"
+            - "dry_then_wet"
     passes:
       default: 1
       selector:

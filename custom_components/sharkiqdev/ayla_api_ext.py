@@ -15,6 +15,8 @@ from typing import Any
 
 from .const import (
     CLEAN_TYPE_DRY,
+    CLEAN_TYPE_DRY_THEN_WET,
+    CLEAN_TYPE_WET,
     PROP_AREAS_TO_CLEAN_V3,
     PROP_FLOW_MODE,
     PROP_MOBILE_APP_ROOM_DEFINITION,
@@ -134,6 +136,38 @@ class SharkExtendedMixin:
         async with await self._vacuum.ayla_api.async_request("post", end_point, json=data) as resp:
             await resp.json()
             _LOGGER.debug("Set flow mode to %d", level)
+
+    async def async_clean_rooms_legacy(
+        self,
+        rooms: list[str],
+        clean_type: str = CLEAN_TYPE_DRY,
+    ) -> None:
+        """Clean rooms using the legacy Areas_To_Clean property.
+
+        Uses operating mode to control clean type:
+          dry          → OperatingModes.START (2)
+          wet          → OperatingModes.MOP (7)
+          dry_then_wet → OperatingModes.VACCUM_AND_MOP (8)
+
+        Args:
+            rooms: User-friendly room names from Robot_Room_List.
+            clean_type: "dry", "wet", or "dry_then_wet".
+        """
+        from .sharkiq.sharkiq import OperatingModes, Properties
+
+        payload = self._vacuum._encode_room_list(rooms)
+        _LOGGER.debug("Legacy room list payload: %s (clean_type=%s)", payload, clean_type)
+
+        await self._vacuum.async_set_property_value(Properties.AREAS_TO_CLEAN, payload)
+
+        mode_map = {
+            CLEAN_TYPE_DRY: OperatingModes.START,
+            CLEAN_TYPE_WET: OperatingModes.MOP,
+            CLEAN_TYPE_DRY_THEN_WET: OperatingModes.VACCUM_AND_MOP,
+        }
+        mode = mode_map.get(clean_type, OperatingModes.START)
+        _LOGGER.info("Legacy clean: rooms=%s mode=%s (%d)", rooms, clean_type, mode)
+        await self._vacuum.async_set_operating_mode(mode)
 
     # --- Room Map ---
 

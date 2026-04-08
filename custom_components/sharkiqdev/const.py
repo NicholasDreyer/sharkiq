@@ -47,6 +47,7 @@ FLOW_MODE_NAMES = {
 # --- Clean types ---
 CLEAN_TYPE_DRY = "dry"
 CLEAN_TYPE_WET = "wet"
+CLEAN_TYPE_DRY_THEN_WET = "dry_then_wet"
 
 # --- Ayla property names (V3 / extended) ---
 PROP_AREAS_TO_CLEAN_V3 = "SET_AreasToClean_V3"

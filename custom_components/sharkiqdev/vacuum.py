@@ -24,6 +24,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .ayla_api_ext import SharkExtendedMixin
 from .const import (
     CLEAN_TYPE_DRY,
+    CLEAN_TYPE_DRY_THEN_WET,
     CLEAN_TYPE_WET,
     DOMAIN,
     LOGGER,
@@ -109,7 +110,7 @@ async def async_setup_entry(
                 cv.ensure_list, vol.Length(min=1), [cv.string]
             ),
             vol.Optional("clean_type", default=CLEAN_TYPE_DRY): vol.In(
-                [CLEAN_TYPE_DRY, CLEAN_TYPE_WET]
+                [CLEAN_TYPE_DRY, CLEAN_TYPE_WET, CLEAN_TYPE_DRY_THEN_WET]
             ),
             vol.Optional("passes", default=1): vol.All(
                 vol.Coerce(int), vol.Range(min=1, max=3)
@@ -137,8 +138,7 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
     _attr_has_entity_name = True
     _attr_name = None
     _attr_supported_features = (
-        VacuumEntityFeature.BATTERY
-        | VacuumEntityFeature.FAN_SPEED
+        VacuumEntityFeature.FAN_SPEED
         | VacuumEntityFeature.PAUSE
         | VacuumEntityFeature.RETURN_HOME
         | VacuumEntityFeature.START
@@ -229,11 +229,6 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         """Determine if the sensor is available based on API results."""
         return self.coordinator.last_update_success and self.is_online
 
-    @property
-    def battery_level(self) -> int | None:
-        """Get the current battery level."""
-        return self.sharkiq.get_property_value(Properties.BATTERY_CAPACITY)
-
     async def async_return_to_base(self, **kwargs: Any) -> None:
         """Have the device return to base."""
         await self.sharkiq.async_set_operating_mode(OperatingModes.RETURN)
@@ -284,26 +279,66 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         passes: int = 1,
         **kwargs: Any,
     ) -> None:
-        """Clean specific rooms using the V3 JSON API (newer LiDAR robots)."""
-        available = self.ext_vac.get_available_rooms()
-        for room in rooms:
-            if room not in available:
-                raise ServiceValidationError(
-                    translation_domain=DOMAIN,
-                    translation_key="invalid_room",
-                    translation_placeholders={
-                        "room": room,
-                        "available": ", ".join(available) if available else "none loaded",
-                    },
-                )
+        """Clean specific rooms with wet/dry control.
 
-        LOGGER.info(
-            "Starting V3 room clean: rooms=%s, type=%s, passes=%d",
-            rooms,
-            clean_type,
-            passes,
-        )
-        await self.ext_vac.async_clean_rooms_v3(rooms, clean_type, passes)
+        Routes to the V3 JSON API if a room map is loaded (newer LiDAR robots),
+        otherwise uses the legacy Areas_To_Clean API with operating mode to control
+        wet/dry (older robots that use Robot_Room_List).
+
+        clean_type options:
+          dry          — vacuum only
+          wet          — mop only
+          dry_then_wet — vacuum first, then mop (V3: two sequential calls;
+                         legacy: VACCUM_AND_MOP operating mode)
+        """
+        if self.ext_vac.room_map:
+            # --- V3 JSON API path ---
+            available = self.ext_vac.get_available_rooms()
+            for room in rooms:
+                if room not in available:
+                    raise ServiceValidationError(
+                        translation_domain=DOMAIN,
+                        translation_key="invalid_room",
+                        translation_placeholders={
+                            "room": room,
+                            "available": ", ".join(available),
+                        },
+                    )
+
+            if clean_type == CLEAN_TYPE_DRY_THEN_WET:
+                LOGGER.info(
+                    "V3 dry-then-wet: rooms=%s, passes=%d (dry pass first)", rooms, passes
+                )
+                await self.ext_vac.async_clean_rooms_v3(rooms, CLEAN_TYPE_DRY, passes)
+                await self.ext_vac.async_clean_rooms_v3(rooms, CLEAN_TYPE_WET, passes)
+            else:
+                LOGGER.info(
+                    "V3 room clean: rooms=%s, type=%s, passes=%d", rooms, clean_type, passes
+                )
+                await self.ext_vac.async_clean_rooms_v3(rooms, clean_type, passes)
+
+        else:
+            # --- Legacy Areas_To_Clean path ---
+            # Validate against the Robot_Room_List property
+            valid_rooms = self.available_rooms or []
+            # Normalise the same way async_clean_room does
+            rooms = [room.replace("_", " ").title() for room in rooms]
+            for room in rooms:
+                if room not in valid_rooms:
+                    raise ServiceValidationError(
+                        translation_domain=DOMAIN,
+                        translation_key="invalid_room",
+                        translation_placeholders={
+                            "room": room,
+                            "available": ", ".join(valid_rooms) if valid_rooms else "none",
+                        },
+                    )
+
+            LOGGER.info(
+                "Legacy room clean: rooms=%s, type=%s", rooms, clean_type
+            )
+            await self.ext_vac.async_clean_rooms_legacy(rooms, clean_type)
+
         await self.coordinator.async_refresh()
 
     async def async_set_flow_mode_service(self, flow_level: int, **kwargs: Any) -> None:
