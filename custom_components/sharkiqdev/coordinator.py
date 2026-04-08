@@ -101,6 +101,17 @@ class SharkIqUpdateCoordinator(DataUpdateCoordinator[Dict[str, SharkIqVacuum]]):
                 ", ".join(sorted(device.properties_full.keys())),
             )
 
+        # Retry loading room maps for any device that is now online but still has no map.
+        # This handles the common case where all devices were offline at HA startup.
+        for dsn, ext_vac in self.extended_vacs.items():
+            if ext_vac.room_map is None and self.device_is_online(dsn):
+                try:
+                    await ext_vac.async_load_room_map()
+                except Exception as err:
+                    LOGGER.debug(
+                        "Room map retry failed for %s: %s", ext_vac.vacuum.name, err
+                    )
+
         return self.shark_vacs
 
     def device_is_online(self, serial_number: str) -> bool:

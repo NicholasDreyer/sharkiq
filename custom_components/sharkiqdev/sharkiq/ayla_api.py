@@ -11,9 +11,12 @@ import aiohttp
 import base64
 import hashlib
 import json
+import logging
 import secrets
 import urllib.parse
 import requests
+
+_LOGGER = logging.getLogger(__name__)
 
 from auth0.authentication import GetToken
 from auth0.asyncify import asyncify
@@ -743,7 +746,17 @@ class AylaApi:
         devices = [SharkIqVacuum(self, d, europe=self.europe) for d in await self.async_list_devices()]
         if update:
             for device in devices:
-                await device.async_get_metadata()
+                try:
+                    await device.async_get_metadata()
+                except Exception as err:
+                    # Metadata is not needed for basic operation; a 500 or transient
+                    # error from one device must not abort the entire update cycle.
+                    _LOGGER.warning(
+                        "Failed to fetch metadata for %s (%s) — skipping: %s",
+                        device.name,
+                        device.serial_number,
+                        err,
+                    )
                 await device.async_update()
         return devices
     

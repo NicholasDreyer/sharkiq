@@ -579,7 +579,10 @@ class SharkIqVacuum:
         """
         url = await self.async_get_file_property_url(property_name)
         if url is None:
-            raise ValueError(f"No file URL found for property '{property_name}' — property may not exist on this device")
+            raise ValueError(
+                f"No datapoint URL found for '{property_name}' — "
+                "the device may be offline or the property has no data yet"
+            )
         session = self.ayla_api.websession
         async with session.get(url) as resp:
             return await resp.read()

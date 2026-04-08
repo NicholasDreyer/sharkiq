@@ -182,10 +182,12 @@ class SharkExtendedMixin:
             room_def_bytes = await self._vacuum.async_get_file_property(
                 PROP_MOBILE_APP_ROOM_DEFINITION
             )
-        except Exception:
-            _LOGGER.debug(
-                "Room definition not available for %s (device may not support V3 API)",
+        except Exception as err:
+            _LOGGER.warning(
+                "Room definition not available for %s: %s — "
+                "will retry on next update when device is online",
                 self._vacuum.name,
+                err,
             )
             return {}
 
